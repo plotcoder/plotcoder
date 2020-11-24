@@ -1,26 +1,15 @@
 """Data utils.
 """
 
-import argparse
-import collections
 import json
-import numpy as np
-import os
-import re
-import string
-import sys
-import random
-import enum
-import six
-import copy
-from six.moves import map
-from six.moves import range
-from six.moves import zip
+
 import ast
 import ast2json
-
+import numpy as np
 import torch
-from torch.autograd import Variable
+
+import transformers
+from collections import OrderedDict
 
 # Special vocabulary symbols
 _PAD = b"_PAD"
@@ -44,39 +33,52 @@ STR_ID = 6
 FUNC_ID = 7
 VALUE_ID = 8
 
+
 def np_to_tensor(inp, output_type, cuda_flag):
 	if output_type == 'float':
-		inp_tensor = Variable(torch.FloatTensor(inp))
+		inp_tensor = torch.FloatTensor(inp)
 	elif output_type == 'int':
-		inp_tensor = Variable(torch.LongTensor(inp))
+		inp_tensor = torch.LongTensor(inp)
 	else:
 		print('undefined tensor type')
 	if cuda_flag:
 		inp_tensor = inp_tensor.cuda()
 	return inp_tensor
 
+
+def _check_nl_code_link(input_word_seq, code_token_seq):
+	start = 0
+	result = []
+	while True:
+		try:
+			idx = input_word_seq.index(code_token_seq[0], start)
+		except ValueError:
+			break
+		start = idx + 1
+		succ = True
+		for i in range(1, len(code_token_seq)):
+			if idx + i >= len(input_word_seq) or code_token_seq[i] != input_word_seq[idx + i]:
+				succ = False
+				break
+		if succ:
+			result.append(idx)
+	return result
+
+
 class DataProcessor(object):
 	def __init__(self, args):
-		self.word_vocab = json.load(open(args.word_vocab, 'r'))
-		self.code_vocab = json.load(open(args.code_vocab, 'r'))
-		self.word_vocab_list = _START_VOCAB[:]
+		self.code_vocab = json.load(open(args.code_vocab, "r", encoding="utf-8"))
 		self.code_vocab_list = _START_VOCAB[:]
 		self.vocab_offset = len(_START_VOCAB)
-		for word in self.word_vocab:
-			while self.word_vocab[word] + self.vocab_offset >= len(self.word_vocab_list):
-				self.word_vocab_list.append(word)
-			self.word_vocab_list[self.word_vocab[word] + self.vocab_offset] = word
-		for word in self.code_vocab:
-			while self.code_vocab[word] + self.vocab_offset >= len(self.code_vocab_list):
-				self.code_vocab_list.append(word)
-			self.code_vocab_list[self.code_vocab[word] + self.vocab_offset] = word
-		self.word_vocab_size = len(self.word_vocab) + self.vocab_offset
+		for word, idx in self.code_vocab:
+			assert self.vocab_offset + idx == len(self.code_vocab_list)
+			self.code_vocab_list.append(word)
+		self.code_vocab = dict(self.code_vocab)
 		self.code_vocab_size = len(self.code_vocab) + self.vocab_offset
 		self.cuda_flag = args.cuda
 		self.nl = args.nl
 		self.code_context = args.code_context
 		self.use_comments = args.use_comments
-		self.local_df_only = args.local_df_only
 		self.target_code_transform = args.target_code_transform
 		self.bow = args.bow
 		self.hierarchy = args.hierarchy
@@ -93,14 +95,19 @@ class DataProcessor(object):
 		self.normal_plot_word_list = ['plot']
 		self.reserved_words = ['plt', 'sns']
 		self.reserved_words += self.scatter_word_list + self.hist_word_list + self.pie_word_list + \
-		self.scatter_plot_word_list + self.hist_plot_word_list + self.normal_plot_word_list
+							   self.scatter_plot_word_list + self.hist_plot_word_list + self.normal_plot_word_list
 		for word in self.code_vocab:
-			if self.code_vocab[word] < 1000 and word != 'subplot' and word[-4:] == 'plot' and not ('_' in word) and not (word in self.reserved_words):
+			if self.code_vocab[word] < 1000 and word != 'subplot' and word[-4:] == 'plot' and not (
+					'_' in word) and not (word in self.reserved_words):
 				self.reserved_words.append(word)
 		self.default_program_mask = [0] * len(self.code_vocab)
 		for word in self.reserved_words:
 			if word in self.code_vocab:
 				self.default_program_mask[self.code_vocab[word]] = 1
+		self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+			args.nl_model_name,
+			cache_dir=args.transformers_cache_dir
+		)
 
 	def label_extraction(self, code_seq):
 		label = -1
@@ -151,7 +158,8 @@ class DataProcessor(object):
 			elif len(tok) > 2 and tok[0] in ["'", '"'] and tok[-1] in ["'", '"']:
 				if tok[1:-1] in reserved_strs:
 					target_strs.append(tok)
-				elif i > 0 and i < len(target_code_seq) - 1 and target_code_seq[i - 1] == '[' and target_code_seq[i + 1] == ']':
+				elif i > 0 and i < len(target_code_seq) - 1 and target_code_seq[i - 1] == '[' and target_code_seq[
+					i + 1] == ']':
 					if i >= 3 and target_code_seq[i - 3] == '.':
 						continue
 					target_strs.append(tok)
@@ -176,11 +184,11 @@ class DataProcessor(object):
 					continue
 				if i == len(target_code_seq) - 1 or target_code_seq[i + 1] not in ['.', ',', ')', ']']:
 					continue
-				if i < len(target_code_seq) - 2 and target_code_seq[i + 1] == '.' and target_code_seq[i + 2] in self.reserved_words and target_code_seq[i + 2] not in ['hist', 'pie']:
+				if i < len(target_code_seq) - 2 and target_code_seq[i + 1] == '.' and target_code_seq[
+					i + 2] in self.reserved_words and target_code_seq[i + 2] not in ['hist', 'pie']:
 					continue
 				target_vars.append(tok)
 		return target_dfs, target_strs, target_vars, reserved_dfs
-
 
 	def ids_to_prog(self, sample, ids):
 		reserved_word_list = sample['reserved_dfs'] + sample['reserved_vars']
@@ -191,11 +199,17 @@ class DataProcessor(object):
 			if i < self.code_vocab_size:
 				prog += [self.code_vocab_list[i]]
 			else:
-				prog += [reserved_word_list[i - self.code_vocab_size]]
+				if i - self.code_vocab_size >= len(sample['reserved_dfs']) + len(sample['reserved_vars']) + len(sample['reserved_strs']):
+					print(i)
+					print(sample['reserved_dfs'])
+					print(sample['reserved_vars'])
+					print(sample['reserved_strs'])
+					prog += [reserved_word_list[-1]]
+				else:
+					prog += [reserved_word_list[i - self.code_vocab_size]]
 			if i == EOS_ID:
 				break
 		return prog
-
 
 	def get_joint_plot_type(self, init_label):
 		if init_label in [0, 3]:
@@ -205,16 +219,28 @@ class DataProcessor(object):
 		else:
 			return 2
 
-
 	def load_data(self, filename):
-		init_samples = json.load(open(filename, 'r'))
+		with open(filename, "r", encoding="utf-8") as reader:
+			init_samples = [json.loads(line) for line in reader]
 		samples = []
 		for sample in init_samples:
-			code_seq = sample['code_tokens']
-			label = self.label_extraction(code_seq)
 			samples.append(sample)
+
 		return samples
 
+	def extract_nl_code_link(self, input_word_seq, tok):
+		return (
+				_check_nl_code_link(input_word_seq, self.tokenizer.encode(tok.lower(), add_special_tokens=False))
+				+ _check_nl_code_link(input_word_seq, self.tokenizer.encode(" " + tok.lower(), add_special_tokens=False))
+				+ _check_nl_code_link(input_word_seq, self.tokenizer.encode(tok.capitalize(), add_special_tokens=False))
+				+ _check_nl_code_link(
+			input_word_seq, self.tokenizer.encode(" " + tok.capitalize(), add_special_tokens=False)
+		)
+		)
+
+	@property
+	def word_vocab_size(self):
+		return len(self.tokenizer) + self.vocab_offset
 
 	def ast_to_seq(self, ast):
 		seq = []
@@ -310,6 +336,9 @@ class DataProcessor(object):
 			if len(ast_tree['body']) == 0:
 				st = ed
 				continue
+			if 'value' not in ast_tree['body'][0] or ast_tree['body'][0]['value'] is None:
+				st = ed
+				continue
 			ast_tree = ast_tree['body'][0]['value']
 			if 'func' not in ast_tree:
 				st = ed
@@ -350,7 +379,7 @@ class DataProcessor(object):
 			if data_value is None:
 				if func_name == 'sns' and len(ast_tree['args']) > 2:
 					data_value = ast_tree['args'][2]
-			
+
 			if data_value is not None:
 				data_value = self.ast_to_seq(data_value)
 			else:
@@ -422,13 +451,10 @@ class DataProcessor(object):
 	def preprocess(self, samples):
 		data = []
 		indices = []
-		cnt_word = 0
-		cnt_code = 0
 		max_target_code_seq_len = 0
 		min_target_code_seq_len = 512
 		for sample_idx, sample in enumerate(samples):
 			init_code_seq = sample['code_tokens']
-			api_seq = sample['api_sequence']
 
 			code_seq = []
 			for tok in init_code_seq:
@@ -436,7 +462,6 @@ class DataProcessor(object):
 					continue
 				code_seq.append(tok)
 
-			reserved_df_size = 0
 			reserved_dfs = []
 			reserved_df_attr_list = []
 			reserved_str_size = 0
@@ -444,49 +469,46 @@ class DataProcessor(object):
 			reserved_vars = []
 			reserved_var_size = 0
 
-			code_context_cell_cnt = 0
-			if self.local_df_only:
-				max_num_code_cells = self.max_num_code_cells
-			else:
-				max_num_code_cells = len(sample['context'])
 			for ctx_idx in range(len(sample['context'])):
-				if code_context_cell_cnt == max_num_code_cells:
-					break
 				if not 'code_tokens' in sample['context'][ctx_idx]:
 					continue
 				cur_code_context = sample['context'][ctx_idx]['code_tokens']
 				if type(cur_code_context) != list:
 					continue
-				code_context_cell_cnt += 1
 				for i in range(len(cur_code_context)):
 					if cur_code_context[i] in self.reserved_words:
 						continue
-					if i > 0 and i < len(cur_code_context) - 2 and cur_code_context[i] == '[' and cur_code_context[i + 1][0] in ["'", '"'] and cur_code_context[i + 2] == ']':
+					if i > 0 and i < len(cur_code_context) - 2 and cur_code_context[i] == '[' and \
+							cur_code_context[i + 1][0] in ["'", '"'] and cur_code_context[i + 2] == ']':
 						if cur_code_context[i - 1] in ['[', ']', '(', ')', '=', ',']:
 							continue
 						if cur_code_context[i - 1] not in reserved_dfs:
 							reserved_dfs.append(cur_code_context[i - 1])
 							reserved_df_attr_list.append([])
-					if i >= 4 and cur_code_context[i] == 'read_csv' and cur_code_context[i - 1] == '.' and cur_code_context[i - 2] == 'pd' and cur_code_context[i - 3] == '=':
+					if i >= 4 and cur_code_context[i] == 'read_csv' and cur_code_context[i - 1] == '.' and \
+							cur_code_context[i - 2] == 'pd' and cur_code_context[i - 3] == '=':
 						if cur_code_context[i - 4] in ['[', ']', '(', ')', '=', ',']:
 							continue
 						if not (cur_code_context[i - 4] in reserved_dfs):
 							reserved_dfs.append(cur_code_context[i - 4])
 							reserved_df_attr_list.append([])
-					if i >= 4 and cur_code_context[i] == 'DataFrame' and cur_code_context[i - 1] == '.' and cur_code_context[i - 2] == 'pd' and cur_code_context[i - 3] == '=':
+					if i >= 4 and cur_code_context[i] == 'DataFrame' and cur_code_context[i - 1] == '.' and \
+							cur_code_context[i - 2] == 'pd' and cur_code_context[i - 3] == '=':
 						if cur_code_context[i - 4] in ['[', ']', '(', ')', '=', ',']:
 							continue
 						if not (cur_code_context[i - 4] in reserved_dfs):
 							reserved_dfs.append(cur_code_context[i - 4])
 							reserved_df_attr_list.append([])
-					if i >= 4 and cur_code_context[i] == 'DataReader' and cur_code_context[i - 1] == '.' and cur_code_context[i - 2] == 'data' and cur_code_context[i - 3] == '=':
+					if i >= 4 and cur_code_context[i] == 'DataReader' and cur_code_context[i - 1] == '.' and \
+							cur_code_context[i - 2] == 'data' and cur_code_context[i - 3] == '=':
 						if cur_code_context[i - 4] in ['[', ']', '(', ')', '=', ',']:
 							continue
 						if not (cur_code_context[i - 4] in reserved_dfs):
 							reserved_dfs.append(cur_code_context[i - 4])
 							reserved_df_attr_list.append([])
-					if i >= 2 and i < len(cur_code_context) - 2 and cur_code_context[i] == 'head' and cur_code_context[i - 1] == '.' \
-					and cur_code_context[i + 1] == '(' and cur_code_context[i + 2] == ')':
+					if i >= 2 and i < len(cur_code_context) - 2 and cur_code_context[i] == 'head' and cur_code_context[
+						i - 1] == '.' \
+							and cur_code_context[i + 1] == '(' and cur_code_context[i + 2] == ')':
 						if cur_code_context[i - 2] in ['[', ']', '(', ')', '=', ',']:
 							continue
 						if not (cur_code_context[i - 2] in reserved_dfs):
@@ -498,12 +520,10 @@ class DataProcessor(object):
 						if not (cur_code_context[i - 4] in reserved_dfs):
 							reserved_dfs.append(cur_code_context[i - 4])
 							reserved_df_attr_list.append([])
-			
+
 			code_context = []
 			code_context_cell_cnt = 0
 			for ctx_idx in range(len(sample['context'])):
-				if code_context_cell_cnt == max_num_code_cells:
-					break
 				if not 'code_tokens' in sample['context'][ctx_idx]:
 					continue
 				init_cur_code_context = sample['context'][ctx_idx]['code_tokens']
@@ -549,7 +569,9 @@ class DataProcessor(object):
 						for tok_idx in range(st + 1, ed):
 							if cur_code_context[tok_idx] in self.reserved_words:
 								continue
-							if len(cur_code_context[tok_idx]) > 2 and cur_code_context[tok_idx][0] in ["'", '"'] and cur_code_context[tok_idx][-1] in ["'", '"'] and not (cur_code_context[tok_idx][1:-1] in reserved_df_attr_list[df_idx]):
+							if len(cur_code_context[tok_idx]) > 2 and cur_code_context[tok_idx][0] in ["'", '"'] and \
+									cur_code_context[tok_idx][-1] in ["'", '"'] and not (
+									cur_code_context[tok_idx][1:-1] in reserved_df_attr_list[df_idx]):
 								if not ('.csv' in cur_code_context[tok_idx] or cur_code_context[tok_idx - 1] == '='):
 									reserved_df_attr_list[df_idx].append(cur_code_context[tok_idx][1:-1])
 									if cur_code_context[tok_idx][1:-1] not in reserved_strs:
@@ -655,7 +677,8 @@ class DataProcessor(object):
 					for tok_idx in range(st + 1, ed):
 						if code_seq[tok_idx] in self.reserved_words:
 							continue
-						if len(code_seq[tok_idx]) > 2 and code_seq[tok_idx][0] in ["'", '"'] and code_seq[tok_idx][-1] in ["'", '"'] and not (code_seq[tok_idx][1:-1] in reserved_df_attr_list[df_idx]):
+						if len(code_seq[tok_idx]) > 2 and code_seq[tok_idx][0] in ["'", '"'] and code_seq[tok_idx][
+							-1] in ["'", '"'] and not (code_seq[tok_idx][1:-1] in reserved_df_attr_list[df_idx]):
 							if not ('.csv' in code_seq[tok_idx] or code_seq[tok_idx - 1] == '='):
 								reserved_df_attr_list[df_idx].append(code_seq[tok_idx][1:-1])
 								if code_seq[tok_idx][1:-1] not in reserved_strs:
@@ -663,7 +686,7 @@ class DataProcessor(object):
 									reserved_str_size += 1
 					i = ed + 1
 					continue
-							
+
 				if code_seq[i] == 'savez':
 					st = i - 1
 					while st >= 0 and code_seq[st] != '\n':
@@ -761,7 +784,8 @@ class DataProcessor(object):
 						for tok_idx in range(st + 1, ed):
 							if code_seq[tok_idx] in self.reserved_words:
 								continue
-							if len(code_seq[tok_idx]) > 2 and code_seq[tok_idx][0] in ["'", '"'] and code_seq[tok_idx][-1] in ["'", '"'] and not (code_seq[tok_idx][1:-1] in reserved_df_attr_list[df_idx]):
+							if len(code_seq[tok_idx]) > 2 and code_seq[tok_idx][0] in ["'", '"'] and code_seq[tok_idx][
+								-1] in ["'", '"'] and not (code_seq[tok_idx][1:-1] in reserved_df_attr_list[df_idx]):
 								if not ('.csv' in code_seq[tok_idx] or code_seq[tok_idx - 1] == '='):
 									reserved_df_attr_list[df_idx].append(code_seq[tok_idx][1:-1])
 									if code_seq[tok_idx][1:-1] not in reserved_strs:
@@ -803,14 +827,14 @@ class DataProcessor(object):
 
 				selected_code_idx = ed_idx + 1
 				code_idx = ed_idx + 1
-			
+
 			init_target_code_seq = target_code_seq[:]
 			target_code_seq = self.code_seq_transform(target_code_seq, reserved_dfs)
 
 			label = self.label_extraction(target_code_seq)
 			if label == -1:
 				continue
-			
+
 			if len(target_code_seq) <= 5:
 				continue
 
@@ -822,23 +846,16 @@ class DataProcessor(object):
 
 			input_word_seq = []
 
+			# Don't apply max_word_len cutoff here. Instead, we apply cutoff after BPE encoding
 			if self.nl and not self.use_comments:
 				nl = sample['nl']
-				nl = nl[:self.max_word_len - 1]
 			elif self.use_comments and not self.nl:
 				nl = sample['comments']
-				nl = nl[:self.max_word_len - 1]
 			elif not self.nl and not self.use_comments:
 				nl = []
 			else:
 				nl = sample['nl'] + sample['comments']
-				if len(nl) > self.max_word_len - 1:
-					if len(sample['comments']) <= self.max_word_len // 2:
-						nl = sample['nl'][:self.max_word_len - 1 - len(sample['comments'])] + sample['comments']
-					elif len(sample['nl']) <= self.max_word_len // 2:
-						nl = sample['nl'] + sample['comments'][:self.max_word_len - 1 - len(sample['nl'])]
-					else:
-						nl = sample['nl'][:self.max_word_len // 2 - 1] + sample['comments'][:self.max_word_len // 2]
+			nl = [w.strip() for w in nl if w.strip()]
 
 			if not self.code_context:
 				code_context = []
@@ -865,44 +882,74 @@ class DataProcessor(object):
 					reserved_vars.remove(tok)
 			reserved_var_size = len(reserved_vars)
 
+			current_span = []
+			for word in nl:
+				if word in _START_VOCAB:
+					current_token_id = len(self.tokenizer) + _START_VOCAB.index(word)
+				elif word in reserved_vars:
+					current_token_id = len(self.tokenizer) + VAR_ID
+				elif word in reserved_dfs:
+					current_token_id = len(self.tokenizer) + DF_ID
+				elif word in reserved_strs:
+					current_token_id = len(self.tokenizer) + STR_ID
+				elif word[0] in ["'", '"'] and word[-1] in ["'", '"'] and word[1:-1] in reserved_vars:
+					current_token_id = len(self.tokenizer) + VAR_ID
+				elif word[0] in ["'", '"'] and word[-1] in ["'", '"'] and word[1:-1] in reserved_dfs:
+					current_token_id = len(self.tokenizer) + DF_ID
+				else:
+					current_span.append(word)
+					continue
+				current_span = " ".join(current_span) + " "
+				input_word_seq = (
+						input_word_seq
+						+ self.tokenizer.encode(current_span, add_special_tokens=False)
+						+ [current_token_id]
+				)
+				current_span = [""]  # Leave an empty string to add another " " before the next span
+			current_span = " ".join(current_span)
+			if current_span:
+				input_word_seq = input_word_seq + self.tokenizer.encode(current_span, add_special_tokens=False)
+			input_word_seq = self.tokenizer.prepare_for_model(
+				input_word_seq,
+				add_special_tokens=True,
+				padding=False,
+				truncation=True,
+				max_length=self.max_word_len,
+				return_attention_mask=False
+			)["input_ids"]
+
 			input_code_seq = []
 			input_code_nl_indices = []
 			input_code_df_seq = []
 			input_code_var_seq = []
 			input_code_str_seq = []
-
-			for i in range(len(code_context)):
-				tok = code_context[i]
+			for i, tok in enumerate(code_context):
 				input_code_nl_indices.append([])
-
 				if tok in _START_VOCAB:
 					input_code_seq.append(_START_VOCAB.index(tok))
 					input_code_df_seq.append(-1)
 					input_code_var_seq.append(-1)
 					input_code_str_seq.append(-1)
 					continue
-
-				nl_lower = [tok.lower() for tok in nl]
-				if tok.lower() in nl_lower:
-					input_code_nl_indices[-1].append(nl_lower.index(tok.lower()))
-				elif ("'" + tok.lower() + "'") in nl_lower:
-					input_code_nl_indices[-1].append(nl_lower.index("'" + tok.lower() + "'"))
-				elif ('"' + tok.lower() + '"') in nl_lower:
-					input_code_nl_indices[-1].append(nl_lower.index('"' + tok.lower() + '"'))
-				elif tok[0] in ["'", '"'] and tok[-1] in ["'", '"'] and tok[1:-1].lower() in nl_lower:
-					input_code_nl_indices[-1].append(nl_lower.index(tok[1:-1].lower()))
-				elif '_' in tok.lower():
-					if tok[0] in ["'", '"'] and tok[-1] in ["'", '"']:
-						tok_list = tok[1:-1].split('_')
-					else:
-						tok_list = tok.split('_')
-					for sub_tok in tok_list:
-						if sub_tok.lower() in nl_lower:
-							input_code_nl_indices[-1].append(nl_lower.index(sub_tok.lower()))
+				tok_strip = tok.strip()
+				if tok_strip:
+					if (tok_strip[0] == tok_strip[-1] == '"') or (tok_strip[0] == tok_strip[-1] == "'"):
+						tok_strip = tok_strip[1:-1].strip()
+					if tok_strip:
+						input_code_nl_indices[-1] += self.extract_nl_code_link(input_word_seq, tok_strip)
+						if "_" in tok_strip:
+							for sub_tok in tok_strip.split("_"):
+								sub_tok_strip = sub_tok.strip()
+								if sub_tok_strip:
+									input_code_nl_indices[-1] += self.extract_nl_code_link(input_word_seq, sub_tok_strip)
+						input_code_nl_indices[-1] = list(OrderedDict.fromkeys(input_code_nl_indices[-1]))  # deduplicate
 				if len(input_code_nl_indices[-1]) > 2:
 					input_code_nl_indices[-1] = input_code_nl_indices[-1][:2]
 				elif len(input_code_nl_indices[-1]) < 2:
-					input_code_nl_indices[-1] = input_code_nl_indices[-1] + [len(nl)] * (2 - len(input_code_nl_indices[-1]))
+					input_code_nl_indices[-1] = (
+							input_code_nl_indices[-1]
+							+ [len(input_word_seq) - 1] * (2 - len(input_code_nl_indices[-1]))  # set to EOS_ID
+					)
 
 				if tok in self.code_vocab:
 					input_code_seq.append(self.code_vocab[tok] + self.vocab_offset)
@@ -962,30 +1009,8 @@ class DataProcessor(object):
 					elif input_code_seq[i] == VAR_ID and input_code_var_seq[i] != -1:
 						input_code_seq[i] = self.code_vocab_size + reserved_df_size + input_code_var_seq[i]
 					elif input_code_seq[i] == STR_ID and input_code_str_seq[i] != -1:
-						input_code_seq[i] = self.code_vocab_size + reserved_df_size + reserved_var_size + input_code_str_seq[i]
-
-			for word in nl:
-				if word in self.word_vocab:
-					input_word_seq.append(self.word_vocab[word] + self.vocab_offset)
-				elif word in _START_VOCAB:
-					input_word_seq.append(_START_VOCAB.index(word))
-				elif word in reserved_vars:
-					input_word_seq.append(VAR_ID)
-				elif word in reserved_dfs:
-					input_word_seq.append(DF_ID)
-				elif word in reserved_strs:
-					str_idx = reserved_strs.index(word)
-					input_word_seq.append(STR_ID)
-				elif word[0] in ["'", '"'] and word[-1] in ["'", '"']:
-					tok = word[1:-1]
-					if tok in reserved_vars:
-						input_word_seq.append(VAR_ID)
-					elif tok in reserved_dfs:
-						input_word_seq.append(DF_ID)
-					else:
-						input_word_seq.append(UNK_ID)
-				else:
-					input_word_seq.append(UNK_ID)
+						input_code_seq[i] = self.code_vocab_size + reserved_df_size + reserved_var_size + \
+											input_code_str_seq[i]
 
 			output_code_seq = []
 			output_code_df_seq = []
@@ -1002,7 +1027,7 @@ class DataProcessor(object):
 						output_code_df_seq.append(self.code_vocab_size + reserved_dfs.index(tok))
 					else:
 						output_code_df_seq.append(-1)
-					
+
 					if tok in target_vars and tok in code_context:
 						if self.hierarchy:
 							output_code_seq[-1] = VAR_ID
@@ -1013,8 +1038,12 @@ class DataProcessor(object):
 					if len(tok) > 2 and tok[0] in ["'", '"'] and tok[-1] in ["'", '"'] and tok[1:-1] in reserved_strs:
 						if self.hierarchy:
 							output_code_seq[-1] = STR_ID
-						output_code_str_seq.append(self.code_vocab_size + reserved_df_size + reserved_var_size + reserved_strs.index(tok[1:-1]))
-					elif tok in code_context and not (tok in reserved_dfs + reserved_vars + reserved_strs + self.reserved_words + sample['imports']) and tok[-1] in ['"', '"']:
+						output_code_str_seq.append(
+							self.code_vocab_size + reserved_df_size + reserved_var_size + reserved_strs.index(
+								tok[1:-1]))
+					elif tok in code_context and not (
+							tok in reserved_dfs + reserved_vars + reserved_strs + self.reserved_words + sample[
+						'imports']) and tok[-1] in ['"', '"']:
 						output_code_str_seq.append(self.code_vocab[tok] + self.vocab_offset)
 					else:
 						output_code_str_seq.append(-1)
@@ -1079,7 +1108,6 @@ class DataProcessor(object):
 				else:
 					output_gt.append(output_code_seq[-1])
 
-			input_word_seq += [EOS_ID]
 			input_code_seq += [EOS_ID]
 			output_code_seq += [EOS_ID]
 			output_gt += [EOS_ID]
@@ -1114,14 +1142,20 @@ class DataProcessor(object):
 			for tok in code_context:
 				if tok in self.code_vocab and tok in target_vars:
 					output_var_mask[self.code_vocab[tok] + self.vocab_offset] = 1
-				if tok in self.code_vocab and not (tok in reserved_dfs + reserved_vars + reserved_strs + self.reserved_words + sample['imports']) and not (tok[-1] in ['"', '"']) and not (tok[0].isdigit() or tok[0] == '-' or '.' in tok) and (i == len(target_code_seq) - 1 or target_code_seq[i + 1] != '('):
+				if tok in self.code_vocab and not (
+						tok in reserved_dfs + reserved_vars + reserved_strs + self.reserved_words + sample[
+					'imports']) and not (tok[-1] in ['"', '"']) and not (
+						tok[0].isdigit() or tok[0] == '-' or '.' in tok) and (
+						i == len(target_code_seq) - 1 or target_code_seq[i + 1] != '('):
 					output_var_mask[self.code_vocab[tok] + self.vocab_offset] = 1
 
 			output_str_mask = [0] * (self.code_vocab_size + reserved_df_size + reserved_var_size + reserved_str_size)
 			for str_idx in range(reserved_str_size):
 				output_str_mask[self.code_vocab_size + reserved_df_size + reserved_var_size + str_idx] = 1
 			for tok in code_context:
-				if tok in self.code_vocab and not (tok in reserved_dfs + reserved_vars + reserved_strs + self.reserved_words + sample['imports']) and tok[-1] in ['"', '"']:
+				if tok in self.code_vocab and not (
+						tok in reserved_dfs + reserved_vars + reserved_strs + self.reserved_words + sample[
+					'imports']) and tok[-1] in ['"', '"']:
 					output_str_mask[self.code_vocab[tok] + self.vocab_offset] = 1
 
 			for i in range(3, self.vocab_offset):
@@ -1141,52 +1175,45 @@ class DataProcessor(object):
 
 			output_code_nl_indices = []
 			for tok in self.code_vocab_list:
-				output_code_nl_indices.append([])
 				if tok in _START_VOCAB:
-					output_code_nl_indices[-1] += [len(nl), len(nl)]
+					links = [len(input_word_seq) - 1, len(input_word_seq) - 1]
 				elif tok in self.scatter_word_list:
-					nl_lower = [tok.lower() for tok in nl]
-					if 'scatter' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('scatter'), len(nl)]
-					elif 'scatterplot' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('scatterplot'), len(nl)]
-					else:
-						output_code_nl_indices[-1] += [len(nl), len(nl)]
+					links = list(OrderedDict.fromkeys(
+						self.extract_nl_code_link(input_word_seq, "scatter")
+						+ self.extract_nl_code_link(input_word_seq, "scatterplot")
+						+ self.extract_nl_code_link(input_word_seq, "scatterplots")
+					))
 				elif tok in self.hist_word_list:
-					nl_lower = [tok.lower() for tok in nl]
-					if 'histogram' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('histogram'), len(nl)]
-					elif 'histograms' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('histograms'), len(nl)]
-					else:
-						output_code_nl_indices[-1] += [len(nl), len(nl)]
+					links = list(OrderedDict.fromkeys(
+						self.extract_nl_code_link(input_word_seq, "histogram")
+						+ self.extract_nl_code_link(input_word_seq, "histograms")
+						+ self.extract_nl_code_link(input_word_seq, "barplot")
+						+ self.extract_nl_code_link(input_word_seq, "barplots")
+					))
 				elif tok in self.pie_word_list:
-					nl_lower = [tok.lower() for tok in nl]
-					if 'pie' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('pie'), len(nl)]
-					else:
-						output_code_nl_indices[-1] += [len(nl), len(nl)]
+					links = list(OrderedDict.fromkeys(
+						self.extract_nl_code_link(input_word_seq, "pie")
+					))
 				elif tok in self.scatter_plot_word_list:
-					nl_lower = [tok.lower() for tok in nl]
-					if 'scatter' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('scatter')]
-					if 'line' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('line')]
-					elif 'linear' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('linear')]
-					if len(output_code_nl_indices[-1]) < 2:
-						output_code_nl_indices[-1] += [len(nl)] * (2 - len(output_code_nl_indices[-1]))
+					links = list(OrderedDict.fromkeys(
+						self.extract_nl_code_link(input_word_seq, "scatter")
+						+ self.extract_nl_code_link(input_word_seq, "line")
+						+ self.extract_nl_code_link(input_word_seq, "linear")
+					))
 				elif tok in self.hist_plot_word_list:
-					nl_lower = [tok.lower() for tok in nl]
-					if 'distribution' in nl_lower:
-						output_code_nl_indices[-1] += [nl_lower.index('distribution'), len(nl)]
-					else:
-						output_code_nl_indices[-1] += [len(nl), len(nl)]
+					links = list(OrderedDict.fromkeys(
+						self.extract_nl_code_link(input_word_seq, "distribution")
+						+ self.extract_nl_code_link(input_word_seq, "distributions")
+					))
 				elif tok in code_context:
-					output_code_nl_indices[-1] += input_code_nl_indices[code_context.index(tok)]
+					links = input_code_nl_indices[code_context.index(tok)]
 				else:
-					output_code_nl_indices[-1] += [len(nl), len(nl)]
-
+					links = [len(input_word_seq) - 1, len(input_word_seq) - 1]
+				if len(links) > 2:
+					links = links[:2]
+				elif len(links) < 2:
+					links += [len(input_word_seq) - 1] * (2 - len(links))
+				output_code_nl_indices.append(links)
 
 			for tok in reserved_dfs + reserved_vars:
 				output_code_indices.append(code_context.index(tok))
@@ -1200,7 +1227,7 @@ class DataProcessor(object):
 
 			if self.bow:
 				input_vector = None
-				word_vector = [0.0] * self.word_vocab_size
+				word_vector = [0.0] * len(self.tokenizer)
 				for word in input_word_seq:
 					if word == UNK_ID:
 						continue
@@ -1312,41 +1339,57 @@ class DataProcessor(object):
 			batch_vectors = np_to_tensor(batch_vectors, 'float', self.cuda_flag)
 			return batch_vectors, batch_labels
 		else:
-			for idx in range(len(batch_word_input)):
-				if len(batch_word_input[idx]) < max_word_len:
-					batch_word_input[idx] = batch_word_input[idx] + [PAD_ID] * (max_word_len - len(batch_word_input[idx]))
-			batch_word_input = np.array(batch_word_input)
-			batch_word_input = np_to_tensor(batch_word_input, 'int', self.cuda_flag)
-			input_dict['nl'] = batch_word_input
-			
+			input_dict["nl"] = transformers.BatchEncoding(
+				self.tokenizer.pad(
+					{"input_ids": batch_word_input},
+					padding="max_length",
+					max_length=max_word_len,
+					return_attention_mask=True
+				),
+				tensor_type="pt"
+			)
+			if self.cuda_flag:
+				input_dict["nl"] = input_dict["nl"].to(torch.device("cuda"))
+
 			for idx in range(len(batch_code_input)):
 				if len(batch_code_input[idx]) < max_input_code_len:
-					batch_code_input[idx] = batch_code_input[idx] + [PAD_ID] * (max_input_code_len - len(batch_code_input[idx]))
+					batch_code_input[idx] = batch_code_input[idx] + [PAD_ID] * (
+							max_input_code_len - len(batch_code_input[idx]))
 			batch_code_input = np.array(batch_code_input)
 			batch_code_input = np_to_tensor(batch_code_input, 'int', self.cuda_flag)
 			input_dict['code_context'] = batch_code_input
 
 			for idx in range(len(batch_code_output)):
 				if len(batch_code_output[idx]) < max_output_code_len:
-					batch_code_output[idx] = batch_code_output[idx] + [PAD_ID] * (max_output_code_len - len(batch_code_output[idx]))
+					batch_code_output[idx] = batch_code_output[idx] + [PAD_ID] * (
+							max_output_code_len - len(batch_code_output[idx]))
 					batch_gt[idx] = batch_gt[idx] + [PAD_ID] * (max_output_code_len - len(batch_gt[idx]))
-					batch_df_output[idx] = batch_df_output[idx] + [-1] * (max_output_code_len - len(batch_df_output[idx]))
-					batch_var_output[idx] = batch_var_output[idx] + [-1] * (max_output_code_len - len(batch_var_output[idx]))
-					batch_str_output[idx] = batch_str_output[idx] + [-1] * (max_output_code_len - len(batch_str_output[idx]))
+					batch_df_output[idx] = batch_df_output[idx] + [-1] * (
+							max_output_code_len - len(batch_df_output[idx]))
+					batch_var_output[idx] = batch_var_output[idx] + [-1] * (
+							max_output_code_len - len(batch_var_output[idx]))
+					batch_str_output[idx] = batch_str_output[idx] + [-1] * (
+							max_output_code_len - len(batch_str_output[idx]))
 			for idx in range(len(batch_output_code_mask)):
 				if len(batch_output_code_mask[idx]) < max_output_code_mask_len:
-					batch_output_code_mask[idx] = batch_output_code_mask[idx] + [0] * (max_output_code_mask_len - len(batch_output_code_mask[idx]))
-					batch_output_df_mask[idx] = batch_output_df_mask[idx] + [0] * (max_output_code_mask_len - len(batch_output_df_mask[idx]))
-					batch_output_var_mask[idx] = batch_output_var_mask[idx] + [0] * (max_output_code_mask_len - len(batch_output_var_mask[idx]))
-					batch_output_str_mask[idx] = batch_output_str_mask[idx] + [0] * (max_output_code_mask_len - len(batch_output_str_mask[idx]))
+					batch_output_code_mask[idx] = batch_output_code_mask[idx] + [0] * (
+							max_output_code_mask_len - len(batch_output_code_mask[idx]))
+					batch_output_df_mask[idx] = batch_output_df_mask[idx] + [0] * (
+							max_output_code_mask_len - len(batch_output_df_mask[idx]))
+					batch_output_var_mask[idx] = batch_output_var_mask[idx] + [0] * (
+							max_output_code_mask_len - len(batch_output_var_mask[idx]))
+					batch_output_str_mask[idx] = batch_output_str_mask[idx] + [0] * (
+							max_output_code_mask_len - len(batch_output_str_mask[idx]))
 			for idx in range(len(batch_input_code_nl_indices)):
 				if len(batch_input_code_nl_indices[idx]) < max_input_code_len:
-					batch_input_code_nl_indices[idx] = batch_input_code_nl_indices[idx] + [[max_word_len - 1, max_word_len - 1] for _ in range(max_input_code_len - len(batch_input_code_nl_indices[idx]))]
+					batch_input_code_nl_indices[idx] = batch_input_code_nl_indices[idx] + [
+						[max_word_len - 1, max_word_len - 1] for _ in
+						range(max_input_code_len - len(batch_input_code_nl_indices[idx]))]
 
 			batch_gt = np.array(batch_gt)
 			batch_gt = np_to_tensor(batch_gt, 'int', self.cuda_flag)
 			input_dict['gt'] = batch_gt
-			
+
 			batch_code_output = np.array(batch_code_output)
 			batch_code_output = np_to_tensor(batch_code_output, 'int', self.cuda_flag)
 			input_dict['code_output'] = batch_code_output
@@ -1390,4 +1433,3 @@ class DataProcessor(object):
 			input_dict['output_code_ctx_indices'] = batch_output_code_ctx_indices
 			input_dict['init_data'] = data[start_idx: start_idx + batch_size]
 			return input_dict, batch_labels
-

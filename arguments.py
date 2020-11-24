@@ -1,13 +1,10 @@
 import argparse
-import time
-import os
-import sys
+
 
 def get_arg_parser(title):
 	parser = argparse.ArgumentParser(description=title)
 	parser.add_argument('--cpu', action='store_true', default=False)
 	parser.add_argument('--eval', action='store_true')
-	parser.add_argument('--model_dir', type=str, default='../checkpoints/model_0')
 	parser.add_argument('--load_model', type=str, default=None)
 	parser.add_argument('--num_LSTM_layers', type=int, default=2)
 	parser.add_argument('--num_MLP_layers', type=int, default=1)
@@ -16,20 +13,21 @@ def get_arg_parser(title):
 	parser.add_argument('--embedding_size', type=int, default=512)
 
 	parser.add_argument('--keep_last_n', type=int, default=None)
-	parser.add_argument('--eval_every_n', type=int, default=1500)
-	parser.add_argument('--log_interval', type=int, default=1500)
-	parser.add_argument('--log_dir', type=str, default='../logs')
-	parser.add_argument('--log_name', type=str, default='model_0.csv')
+	parser.add_argument('--eval_every_n', type=int, default=3000)
+	parser.add_argument('--log_interval', type=int, default=3000)
+	parser.add_argument('--out_dir', type=str)
 
-	parser.add_argument('--max_eval_size', type=int, default=1000)
+	parser.add_argument('--max_eval_size', type=int, default=None)
+
+	parser.add_argument("--transformers_cache_dir", type=str, default=None)
+	parser.add_argument("--do_profiling", action="store_true")
 
 	data_group = parser.add_argument_group('data')
 	data_group.add_argument('--train_dataset', type=str, default='../data/train_plot.json')
 	data_group.add_argument('--dev_dataset', type=str, default='../data/dev_plot_hard.json')
 	data_group.add_argument('--test_dataset', type=str, default='../data/test_plot_hard.json')
+	data_group.add_argument("--data_cache_dir", type=str, default="../data")
 	data_group.add_argument('--code_vocab', type=str, default='../data/code_vocab.json')
-	data_group.add_argument('--word_vocab', type=str, default='../data/nl_vocab.json')
-	data_group.add_argument('--word_vocab_size', type=int, default=None)
 	data_group.add_argument('--code_vocab_size', type=int, default=None)
 	data_group.add_argument('--num_plot_types', type=int, default=6)
 	data_group.add_argument('--joint_plot_types', action='store_true', default=False)
@@ -37,7 +35,6 @@ def get_arg_parser(title):
 	data_group.add_argument('--nl', action='store_true', default=False)
 	data_group.add_argument('--use_comments', action='store_true', default=False)
 	data_group.add_argument('--code_context', action='store_true', default=False)
-	data_group.add_argument('--local_df_only', action='store_true', default=False)
 	data_group.add_argument('--target_code_transform', action='store_true', default=False)
 	data_group.add_argument('--max_num_code_cells', type=int, default=2)
 	data_group.add_argument('--max_word_len', type=int, default=512)
@@ -49,18 +46,25 @@ def get_arg_parser(title):
 	model_group.add_argument('--hierarchy', action='store_true', default=False)
 	model_group.add_argument('--copy_mechanism', action='store_true', default=False)
 	model_group.add_argument('--nl_code_linking', action='store_true', default=False)
+	model_group.add_argument("--nl_model_name", type=str, default="roberta-base")
 	model_group.add_argument('--label_prediction', action='store_true', default=False)
 
 	train_group = parser.add_argument_group('train')
-	train_group.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'sgd', 'rmsprop'])
+	train_group.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'sgd', 'rmsprop', "adamw"])
 	train_group.add_argument('--lr', type=float, default=1e-3)
-	train_group.add_argument('--lr_decay_steps', type=int, default=6000)
-	train_group.add_argument('--lr_decay_rate', type=float, default=0.9)
+	train_group.add_argument("--adam_beta1", type=float, default=0.9)
+	train_group.add_argument("--adam_beta2", type=float, default=0.999)
+	train_group.add_argument("--adam_eps", type=float, default=1e-8)
+	train_group.add_argument("--weight_decay", type=float, default=0.0)
+	train_group.add_argument("--warmup_steps", type=int, default=2000)
 	train_group.add_argument('--dropout_rate', type=float, default=0.2)
-	train_group.add_argument('--gradient_clip', type=float, default=5.0)
+	train_group.add_argument('--gradient_clip', type=float, default=None)
 	train_group.add_argument('--num_epochs', type=int, default=50)
 	train_group.add_argument('--batch_size', type=int, default=32)
 	train_group.add_argument('--param_init', type=float, default=0.1)
 	train_group.add_argument('--seed', type=int, default=None)
+	train_group.add_argument('--freeze_nl_embeddings', action="store_true")
+	train_group.add_argument('--freeze_nl_encoder_first_n', type=int, default=0)
+	train_group.add_argument('--freeze_nl_pooler', action="store_true")
 
 	return parser

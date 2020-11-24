@@ -25,30 +25,29 @@ In the following we list some important arguments for data preprocessing:
 
 1. To run the hierarchical model:
 
-`python run.py --nl --use_comments --code_context --nl_code_linking --copy_mechanism --hierarchy --target_code_transform`
+`python run.py --nl --use_comments --code_context --nl_code_linking --copy_mechanism --hierarchy`
 
 2. To run the non-hierarchical model with the copy mechanism:
 
-`python run.py --nl --use_comments --code_context --nl_code_linking --copy_mechanism  --target_code_transform`
+`python run.py --nl --use_comments --code_context --nl_code_linking --copy_mechanism`
 
 3. To run the LSTM decoder without the copy mechanism, i.e., one-hot encoding for data items, but preserve the nl correspondence in the input code sequence:
 
-`python run.py --nl --use_comments --code_context --nl_code_linking  --target_code_transform`
+`python run.py --nl --use_comments --code_context --nl_code_linking`
 
 4. To run the LSTM decoder with the standard copy mechanism, do not preserve the nl correspondence:
 
-`python run.py --nl --use_comments --code_context --copy_mechanism  --target_code_transform`
+`python run.py --nl --use_comments --code_context --copy_mechanism`
 
 5. To run the LSTM decoder without the copy mechanism, i.e., one-hot encoding for data items as in prior work:
 
-`python run.py --nl --use_comments --code_context  --target_code_transform`
+`python run.py --nl --use_comments --code_context`
 
 ### Key arguments
 In the following we list some important arguments for running neural models:
 * `--nl`: include the previous natural language cell as the model input. Note that the current code does not support including natural language from multiple cells, because it may not make sense to add NL instructions for previous code cells instead of the current one to confuse the model.
 * `--use_comments`: include the comments in the current code cell as the model input.
 * `--code_context`: include the code context as the model input.
-* `--target_code_transform`: standardize the target code sequence into a more canonical form.
 * `--max_num_code_cells`: the number of code cells included as the code context. Default: `2`. Note that setting it to `0` is not equivalent to not using the code context, because it still includes: (1) the code within the current code cell before the code snippet starting to generate the plots; and (2) the code context including the data frames and their attributes.
 * `--nl_code_linking`: if a code token appears in the nl, concatenate the code token embedding with the corresponding nl embedding.
 * `--copy_mechanism`: use the copy mechanism for the decoder.

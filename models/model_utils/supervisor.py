@@ -1,13 +1,7 @@
-import numpy as np
-import argparse
-import sys
 import os
-import torch
 import re
-import json
-import time
 
-from torch.nn.utils import clip_grad_norm
+import torch
 
 from ..data_utils import data_utils
 
@@ -24,15 +18,15 @@ class Supervisor(object):
 		self.keep_last_n = args.keep_last_n
 		self.global_step = 0
 		self.batch_size = args.batch_size
-		self.model_dir = args.model_dir
+		if not os.path.exists(args.out_dir):
+			os.makedirs(args.out_dir)
+		self.model_dir = os.path.join(args.out_dir, 'models')
 		self.bow = args.bow
-
 
 	def load_pretrained(self, load_model):
 		print("Read model parameters from %s." % load_model)
 		checkpoint = torch.load(load_model)
 		self.model.load_state_dict(checkpoint)
-
 
 	def save_model(self):
 		if not os.path.exists(self.model_dir):
@@ -54,7 +48,6 @@ class Supervisor(object):
 			if len(ckpts) > self.keep_last_n:
 				ckpts.sort()
 				os.unlink(os.path.join(self.model_dir, ckpts[0][1]))
-
 
 	def train(self, batch_input, batch_labels):
 		self.model.optimizer.zero_grad()
@@ -84,53 +77,54 @@ class Supervisor(object):
 		test_label_acc = 0
 		test_data_acc = 0
 		test_acc = 0
-		if self.bow:
-			predictions = []
-			for batch_idx in range(0, data_size, self.batch_size):
-				batch_input, batch_labels = self.data_processor.get_batch(eval_data, self.batch_size, batch_idx)
-				cur_loss, cur_pred_logits = self.model(batch_input, batch_labels, eval_flag=True)
-				cur_predictions = cur_pred_logits.argmax(dim=1)
-				test_loss += cur_loss.item() * batch_labels.size()[0]
-				test_label_acc += torch.sum(torch.eq(cur_predictions, batch_labels)).item()
-				print('batch_idx: ', batch_idx, 'test_label_acc: ', test_label_acc)
-				predictions += cur_predictions.data.cpu().numpy().tolist()
-		else:
-			predictions = []
-			for batch_idx in range(0, data_size, self.batch_size):
-				batch_input, batch_labels = self.data_processor.get_batch(eval_data, self.batch_size, batch_idx)
-				cur_loss, cur_pred_logits, cur_predictions = self.model(batch_input, batch_labels, eval_flag=True)
-				test_loss += cur_loss.item() * batch_labels.size()[0]
-				cur_predictions = cur_predictions.data.cpu().numpy().tolist()
-				for i, sample in enumerate(batch_input['init_data']):
-					gt_prog = self.data_processor.ids_to_prog(sample, sample['output_gt'])
-					pred_prog = self.data_processor.ids_to_prog(sample, cur_predictions[i])
-					gt_label = sample['label']
-					pred_label = self.data_processor.label_extraction(pred_prog)
-					if gt_label == pred_label:
-						cur_test_label_acc = 1
-					else:
-						cur_test_label_acc = 0
-					target_dfs, target_strs, target_vars = sample['target_dfs'], sample['target_strs'], sample['target_vars']
-					pred_dfs, pred_strs, pred_vars, _ = self.data_processor.data_extraction(pred_prog,
-						sample['reserved_dfs'], sample['reserved_strs'], sample['reserved_vars'])
-
-					if data_order_invariant:
-						if set(target_dfs + target_strs + target_vars) == set(pred_dfs + pred_strs + pred_vars) and \
-						len(target_dfs + target_strs + target_vars) == len(pred_dfs + pred_strs + pred_vars):
-							cur_test_data_acc = 1
+		with torch.no_grad():
+			if self.bow:
+				predictions = []
+				for batch_idx in range(0, data_size, self.batch_size):
+					batch_input, batch_labels = self.data_processor.get_batch(eval_data, self.batch_size, batch_idx)
+					cur_loss, cur_pred_logits = self.model(batch_input, batch_labels, eval_flag=True)
+					cur_predictions = cur_pred_logits.argmax(dim=1)
+					test_loss += cur_loss.item() * batch_labels.size()[0]
+					test_label_acc += torch.sum(torch.eq(cur_predictions, batch_labels)).item()
+					print('batch_idx: ', batch_idx, 'test_label_acc: ', test_label_acc)
+					predictions += cur_predictions.data.cpu().numpy().tolist()
+			else:
+				predictions = []
+				for batch_idx in range(0, data_size, self.batch_size):
+					batch_input, batch_labels = self.data_processor.get_batch(eval_data, self.batch_size, batch_idx)
+					cur_loss, cur_pred_logits, cur_predictions = self.model(batch_input, batch_labels, eval_flag=True)
+					test_loss += cur_loss.item() * batch_labels.size()[0]
+					cur_predictions = cur_predictions.data.cpu().numpy().tolist()
+					for i, sample in enumerate(batch_input['init_data']):
+						gt_prog = self.data_processor.ids_to_prog(sample, sample['output_gt'])
+						pred_prog = self.data_processor.ids_to_prog(sample, cur_predictions[i])
+						gt_label = sample['label']
+						pred_label = self.data_processor.label_extraction(pred_prog)
+						if gt_label == pred_label:
+							cur_test_label_acc = 1
 						else:
-							cur_test_data_acc = 0
-					else:
-						if target_dfs + target_strs + target_vars == pred_dfs + pred_strs + pred_vars:
-							cur_test_data_acc = 1
+							cur_test_label_acc = 0
+						target_dfs, target_strs, target_vars = sample['target_dfs'], sample['target_strs'], sample['target_vars']
+						pred_dfs, pred_strs, pred_vars, _ = self.data_processor.data_extraction(pred_prog,
+							sample['reserved_dfs'], sample['reserved_strs'], sample['reserved_vars'])
+						if data_order_invariant:
+							if set(target_dfs + target_strs + target_vars) == set(pred_dfs + pred_strs + pred_vars) and \
+									len(target_dfs + target_strs + target_vars) == len(
+								pred_dfs + pred_strs + pred_vars):
+								cur_test_data_acc = 1
+							else:
+								cur_test_data_acc = 0
 						else:
-							cur_test_data_acc = 0
-					cur_test_acc = min(cur_test_label_acc, cur_test_data_acc)
-					test_label_acc += cur_test_label_acc
-					test_data_acc += cur_test_data_acc
-					test_acc += cur_test_acc
-				print('batch_idx: ', batch_idx, 'test_label_acc: ', test_label_acc, 'test_data_acc', test_data_acc, 'test_acc', test_acc)
-				predictions += cur_predictions
+							if target_dfs + target_strs + target_vars == pred_dfs + pred_strs + pred_vars:
+								cur_test_data_acc = 1
+							else:
+								cur_test_data_acc = 0
+						cur_test_acc = min(cur_test_label_acc, cur_test_data_acc)
+						test_label_acc += cur_test_label_acc
+						test_data_acc += cur_test_data_acc
+						test_acc += cur_test_acc
+					print('batch_idx: ', batch_idx, 'test_label_acc: ', test_label_acc, 'test_data_acc', test_data_acc, 'test_acc', test_acc)
+					predictions += cur_predictions
 
 		test_loss /= data_size
 		test_label_acc = test_label_acc * 1.0 / data_size

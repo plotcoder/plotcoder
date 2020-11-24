@@ -1,11 +1,5 @@
-import random
-import numpy as np
-import time
-
-import torch
 import torch.nn as nn
-from torch.autograd import Variable
-import torch.nn.functional as F
+
 
 class MLPModel(nn.Module):
 	"""
